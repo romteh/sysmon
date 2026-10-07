@@ -1,0 +1,12 @@
+[Unit]
+Description=sysmon desktop notifier (shows alerts from the sysmon system service)
+Documentation=file:/usr/local/share/doc/sysmon/README.md
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/sysmon notify
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=default.target

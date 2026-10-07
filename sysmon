@@ -1,0 +1,2236 @@
+#!/usr/bin/python3 -I
+"""sysmon - lightweight system resource & pressure monitor.
+
+Observes, logs and notifies ONLY. It never kills processes, restarts services,
+drops caches or changes any system setting.
+
+Subcommands:
+  daemon      run the monitor (normally started by sysmon.service as root)
+  notify      desktop notifier (normally started by the sysmon-notify user service)
+  status      show the current state (also available as `sysmon-status`)
+  history     print recorded samples as a table (post-mortem analysis)
+  events      show past state changes / alerts
+  snapshots   list diagnostic snapshots
+  snapshot    ask the running daemon to take a snapshot now (root)
+  selftest    run simulated scenarios through the alert logic (no real load)
+  config      validate and print the effective configuration
+"""
+
+import argparse
+import collections
+import configparser
+import csv
+import ctypes
+import datetime
+import glob
+import json
+import os
+import pwd
+import queue
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+
+VERSION = "1.0"
+CONF_PATH = "/etc/sysmon.conf"
+RUN_DIR = "/run/sysmon"
+PAGE = os.sysconf("SC_PAGE_SIZE")
+CLK_TCK = os.sysconf("SC_CLK_TCK")
+MB = 1024 * 1024
+LEVEL_NAMES = ("NORMAL", "WARNING", "CRITICAL")
+
+DEFAULTS_INI = """
+[general]
+interval = 5
+recovery_hold = 60
+disks = auto
+[memory]
+avail_warn_pct = 15
+avail_crit_pct = 7.5
+avail_warn_hold = 15
+avail_crit_hold = 10
+psi_some_warn = 10
+psi_some_warn_hold = 15
+psi_some_crit = 40
+psi_full_crit = 10
+psi_crit_hold = 10
+[trend]
+enabled = yes
+window = 90
+floor_pct = 3
+min_rate_mb_s = 5
+arm_below_avail_pct = 30
+warn_eta = 300
+crit_eta = 90
+warn_hold = 10
+crit_hold = 10
+[swap]
+used_warn_pct = 50
+swapout_warn_mb_s = 5
+activity_warn_mb_s = 20
+warn_hold = 30
+used_crit_pct = 90
+crit_hold = 10
+[reclaim]
+refault_warn_pages_s = 5000
+allocstall_warn_s = 50
+pgscan_direct_warn_pages_s = 20000
+majfault_warn_s = 3000
+warn_hold = 20
+[io]
+psi_full_warn = 15
+psi_some_warn = 40
+psi_warn_hold = 30
+psi_full_crit = 40
+psi_crit_hold = 15
+blocked_warn = 5
+blocked_warn_hold = 30
+blocked_crit = 15
+blocked_crit_hold = 15
+util_warn = 90
+iowait_warn = 15
+util_warn_hold = 60
+util_crit = 98
+iowait_crit = 30
+util_crit_hold = 30
+[cpu]
+psi_some_avg60_warn = 50
+psi_warn_hold = 15
+load_warn_factor = 1.5
+load_warn_hold = 60
+psi_some_crit = 85
+load_crit_factor = 2.0
+crit_hold = 60
+[combination]
+enabled = yes
+min_categories = 2
+[space]
+filesystems = /, /boot/efi
+check_interval = 60
+warn_used_pct = 90
+crit_used_pct = 95
+warn_free_gb = 25
+crit_free_gb = 10
+gb_rules_min_size_gb = 100
+recovery_hold = 600
+[notify]
+flap_guard = 300
+update_interval = 120
+wall_on_critical = no
+[history]
+dir = /var/log/sysmon
+retention_days = 7
+max_total_mb = 100
+min_fs_free_mb = 2048
+[snapshots]
+max_files = 300
+max_total_mb = 150
+critical_interval = 120
+top_n = 15
+"""
+
+
+# --------------------------------------------------------------------------
+# Configuration
+# --------------------------------------------------------------------------
+
+class Config:
+    def __init__(self, path=CONF_PATH):
+        self.cp = configparser.ConfigParser(inline_comment_prefixes=("#", ";"))
+        self.cp.read_string(DEFAULTS_INI)
+        self.path = path
+        self.loaded = []
+        self.unknown = []
+        if path and os.path.exists(path):
+            user = configparser.ConfigParser(inline_comment_prefixes=("#", ";"))
+            user.read(path)
+            for sec in user.sections():
+                for key, val in user.items(sec, raw=True):
+                    if not self.cp.has_option(sec, key):
+                        self.unknown.append("%s.%s" % (sec, key))
+                        continue
+                    self.cp.set(sec, key, val)
+            self.loaded = [path]
+
+    def f(self, sec, key):
+        return self.cp.getfloat(sec, key)
+
+    def i(self, sec, key):
+        return int(self.cp.getfloat(sec, key))
+
+    def b(self, sec, key):
+        return self.cp.getboolean(sec, key)
+
+    def s(self, sec, key):
+        return self.cp.get(sec, key).strip()
+
+    def lst(self, sec, key):
+        return [x.strip() for x in self.s(sec, key).split(",") if x.strip()]
+
+    def validate(self):
+        """Raise ValueError if any value is not parseable."""
+        for sec in self.cp.sections():
+            for key, val in self.cp.items(sec):
+                if key in ("disks", "filesystems", "dir"):
+                    continue
+                if val.lower() in ("yes", "no", "true", "false", "on", "off"):
+                    continue
+                float(val)
+
+
+# --------------------------------------------------------------------------
+# Small helpers
+# --------------------------------------------------------------------------
+
+def read_text(path):
+    with open(path, "rb") as f:
+        return f.read().decode("utf-8", "replace")
+
+
+def read_kv(path):
+    """Parse 'Key:  123 kB' style files into {key: int}."""
+    out = {}
+    for line in read_text(path).splitlines():
+        k, _, v = line.partition(":")
+        v = v.split()
+        if v:
+            try:
+                out[k] = int(v[0])
+            except ValueError:
+                pass
+    return out
+
+
+def read_vmstat():
+    out = {}
+    for line in read_text("/proc/vmstat").splitlines():
+        k, _, v = line.partition(" ")
+        try:
+            out[k] = int(v)
+        except ValueError:
+            pass
+    return out
+
+
+def read_psi():
+    out = {}
+    for res in ("cpu", "memory", "io"):
+        d = {}
+        try:
+            for line in read_text("/proc/pressure/" + res).splitlines():
+                parts = line.split()
+                vals = dict(p.split("=") for p in parts[1:])
+                d[parts[0]] = (float(vals["avg10"]), float(vals["avg60"]),
+                               float(vals["avg300"]), int(vals["total"]))
+        except (OSError, KeyError, ValueError, IndexError):
+            pass
+        out[res] = d
+    return out
+
+
+def gb(mb):
+    return "%.1f GB" % (mb / 1024.0)
+
+
+def fmt_eta(s):
+    if s is None:
+        return "-"
+    if s < 120:
+        return "~%d s" % max(0, int(round(s / 5.0) * 5))
+    return "~%d min" % int(round(s / 60.0))
+
+
+def fmt_dur(s):
+    s = int(s)
+    if s < 60:
+        return "%d s" % s
+    if s < 3600:
+        return "%d min %d s" % (s // 60, s % 60)
+    return "%d h %d min" % (s // 3600, (s % 3600) // 60)
+
+
+def fmt_num(v):
+    if v is None:
+        return ""
+    if isinstance(v, float):
+        s = "%.2f" % v
+        return s.rstrip("0").rstrip(".") if "." in s else s
+    return str(v)
+
+
+def fs_key(mp):
+    return "root" if mp == "/" else mp.strip("/").replace("/", "_")
+
+
+def now_str(ts=None):
+    return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(ts if ts is not None else time.time()))
+
+
+def detect_disks():
+    out = []
+    for name in sorted(os.listdir("/sys/block")):
+        if name.startswith(("loop", "ram", "zram", "sr", "fd", "dm-", "md")):
+            continue
+        if os.path.exists("/sys/block/%s/device" % name):
+            out.append(name)
+    return out
+
+
+# --------------------------------------------------------------------------
+# Metric collection (pure /proc + /sys reads, no forking)
+# --------------------------------------------------------------------------
+
+class Collector:
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.ncpu = os.cpu_count() or 1
+        d = cfg.s("general", "disks")
+        self.disks = detect_disks() if d == "auto" else cfg.lst("general", "disks")
+        self.filesystems = cfg.lst("space", "filesystems")
+        self.prev = None
+        self.fs_last = {}
+        self.fs_checked = -1e9
+
+    def _raw(self):
+        r = {"t": time.monotonic(), "wall": time.time()}
+        r["mem"] = read_kv("/proc/meminfo")
+        r["vm"] = read_vmstat()
+        for line in read_text("/proc/stat").splitlines():
+            if line.startswith("cpu "):
+                r["cpu"] = [int(x) for x in line.split()[1:]]
+            elif line.startswith("procs_running"):
+                r["procs_running"] = int(line.split()[1])
+            elif line.startswith("procs_blocked"):
+                r["procs_blocked"] = int(line.split()[1])
+        la = read_text("/proc/loadavg").split()
+        r["load"] = (float(la[0]), float(la[1]), float(la[2]))
+        r["threads"] = int(la[3].split("/")[1])
+        r["psi"] = read_psi()
+        disk = {}
+        for line in read_text("/proc/diskstats").splitlines():
+            p = line.split()
+            if len(p) >= 14 and p[2] in self.disks:
+                disk[p[2]] = [int(x) for x in p[3:14]]
+        r["disk"] = disk
+        return r
+
+    def check_fs(self, m, force=False):
+        now = time.monotonic()
+        if force or now - self.fs_checked >= self.cfg.f("space", "check_interval"):
+            self.fs_checked = now
+            for mp in self.filesystems:
+                try:
+                    st = os.statvfs(mp)
+                except OSError:
+                    self.fs_last[mp] = None
+                    continue
+                used = (st.f_blocks - st.f_bfree) * st.f_frsize
+                avail = st.f_bavail * st.f_frsize
+                size = st.f_blocks * st.f_frsize
+                pct = 100.0 * used / (used + avail) if used + avail else 0.0
+                self.fs_last[mp] = {"pct": pct, "free_gb": avail / 1024.0 ** 3,
+                                    "size_gb": size / 1024.0 ** 3}
+        m["fs"] = dict(self.fs_last)
+        for mp in self.filesystems:
+            v = self.fs_last.get(mp)
+            k = fs_key(mp)
+            m["fs_%s_pct" % k] = round(v["pct"], 2) if v else None
+            m["fs_%s_free_gb" % k] = round(v["free_gb"], 2) if v else None
+
+    def sample(self):
+        """Return a metrics dict, or None on the very first call (no deltas yet)."""
+        r = self._raw()
+        p, self.prev = self.prev, r
+        if p is None:
+            return None
+        dt = max(1e-3, r["t"] - p["t"])
+        mem = r["mem"]
+        m = {"epoch": r["wall"], "interval_s": dt, "ncpu": self.ncpu}
+        kb = 1.0 / 1024
+        total = mem.get("MemTotal", 1) * kb
+        avail = mem.get("MemAvailable", 0) * kb
+        shmem = mem.get("Shmem", 0) * kb
+        m.update({
+            "mem_total_mb": total,
+            "mem_avail_mb": avail,
+            "mem_avail_pct": 100.0 * avail / total,
+            "mem_free_mb": mem.get("MemFree", 0) * kb,
+            "anon_mb": mem.get("AnonPages", 0) * kb,
+            "shmem_mb": shmem,
+            "cache_mb": (mem.get("Cached", 0) + mem.get("Buffers", 0)) * kb - shmem,
+            "kernel_mb": (mem.get("Slab", 0) + mem.get("KernelStack", 0) + mem.get("PageTables", 0)) * kb,
+            "slab_unrecl_mb": mem.get("SUnreclaim", 0) * kb,
+            "dirty_mb": mem.get("Dirty", 0) * kb,
+            "writeback_mb": mem.get("Writeback", 0) * kb,
+            "swap_total_mb": mem.get("SwapTotal", 0) * kb,
+            "swap_used_mb": (mem.get("SwapTotal", 0) - mem.get("SwapFree", 0)) * kb,
+        })
+        vm, pvm = r["vm"], p["vm"]
+
+        def rate(*keys):
+            return sum(vm.get(k, 0) - pvm.get(k, 0) for k in keys) / dt
+
+        refault_keys = [k for k in vm if k.startswith("workingset_refault")]
+        stall_keys = [k for k in vm if k.startswith("allocstall")]
+        m["swapin_mb_s"] = rate("pswpin") * PAGE / MB
+        m["swapout_mb_s"] = rate("pswpout") * PAGE / MB
+        m["majflt_s"] = rate("pgmajfault")
+        m["refault_s"] = rate(*refault_keys)
+        m["allocstall_s"] = rate(*stall_keys)
+        m["pgscan_direct_s"] = rate("pgscan_direct")
+        m["oom_kills"] = vm.get("oom_kill", 0) - pvm.get("oom_kill", 0)
+
+        # PSI
+        for res, short in (("memory", "mem"), ("io", "io"), ("cpu", "cpu")):
+            cur, prv = r["psi"].get(res, {}), p["psi"].get(res, {})
+            for kind in ("some", "full"):
+                v = cur.get(kind)
+                m["psi_%s_%s10" % (short, kind)] = v[0] if v else 0.0
+                m["psi_%s_%s60" % (short, kind)] = v[1] if v else 0.0
+                pv = prv.get(kind)
+                m["psi_%s_%s_int" % (short, kind)] = (
+                    min(100.0, (v[3] - pv[3]) / (dt * 1e6) * 100.0) if v and pv else 0.0)
+
+        # CPU
+        c, pc = r["cpu"], p["cpu"]
+        d = [a - b for a, b in zip(c, pc)]
+        tot = sum(d[:8]) or 1
+        m["cpu_pct"] = 100.0 * (tot - d[3] - d[4]) / tot
+        m["iowait_pct"] = 100.0 * d[4] / tot
+        m["steal_pct"] = 100.0 * d[7] / tot if len(d) > 7 else 0.0
+        m["load1"], m["load5"], m["load15"] = r["load"]
+        m["procs_running"] = r.get("procs_running", 0)
+        m["procs_blocked"] = r.get("procs_blocked", 0)
+        m["threads_total"] = r["threads"]
+
+        # Disks: fields (0-based after name) reads,rmerged,rsect,rticks,writes,wmerged,wsect,wticks,inflight,ioticks,weighted
+        best = None
+        rsum = wsum = 0.0
+        per = {}
+        for name, v in r["disk"].items():
+            pv = p["disk"].get(name)
+            if not pv:
+                continue
+            dd = [a - b for a, b in zip(v, pv)]
+            util = min(100.0, dd[9] / (dt * 1000.0) * 100.0)
+            ios = dd[0] + dd[4]
+            await_ms = (dd[3] + dd[7]) / ios if ios > 0 else 0.0
+            rmb = dd[2] * 512.0 / MB / dt
+            wmb = dd[6] * 512.0 / MB / dt
+            rsum += rmb
+            wsum += wmb
+            per[name] = {"util": util, "r_mb_s": rmb, "w_mb_s": wmb, "await_ms": await_ms,
+                         "inflight": v[8]}
+            if best is None or util > per[best]["util"]:
+                best = name
+        m["disks"] = per
+        m["disk_dev"] = best or ""
+        m["disk_util"] = per[best]["util"] if best else 0.0
+        m["disk_await_ms"] = per[best]["await_ms"] if best else 0.0
+        m["disk_r_mb_s"] = rsum
+        m["disk_w_mb_s"] = wsum
+        self.check_fs(m)
+        return m
+
+
+# --------------------------------------------------------------------------
+# Trend prediction
+# --------------------------------------------------------------------------
+
+def _median(v):
+    v = sorted(v)
+    n = len(v)
+    if n == 0:
+        return 0.0
+    return v[n // 2] if n % 2 else 0.5 * (v[n // 2 - 1] + v[n // 2])
+
+
+class Trend:
+    """Robust RAM-exhaustion prediction.
+
+    headroom = MemAvailable + SwapFree - floor. The decline rate is the
+    Theil-Sen estimator (median of all pairwise slopes) over `window` seconds:
+    a short allocation spike only affects a minority of the pairs and does not
+    move the median, while a sustained decline does.
+    """
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.buf = collections.deque()
+
+    def update(self, now, m):
+        c = self.cfg
+        window = c.f("trend", "window")
+        floor = m["mem_total_mb"] * c.f("trend", "floor_pct") / 100.0
+        swap_free = max(0.0, m["swap_total_mb"] - m["swap_used_mb"])
+        head = m["mem_avail_mb"] + swap_free - floor
+        self.buf.append((now, head))
+        while self.buf and now - self.buf[0][0] > window:
+            self.buf.popleft()
+        m["headroom_mb"] = head
+        m["mem_slope_mb_s"] = None
+        m["eta_s"] = None
+        pts = list(self.buf)
+        if len(pts) < 4 or now - pts[0][0] < 0.66 * window:
+            return
+        slopes = []
+        for i in range(len(pts)):
+            t1, h1 = pts[i]
+            for j in range(i + 1, len(pts)):
+                t2, h2 = pts[j]
+                if t2 > t1:
+                    slopes.append((h2 - h1) / (t2 - t1))
+        slope = _median(slopes)
+        m["mem_slope_mb_s"] = slope
+        if not c.b("trend", "enabled"):
+            return
+        if m["mem_avail_pct"] >= c.f("trend", "arm_below_avail_pct"):
+            return
+        rate = -slope
+        if rate < c.f("trend", "min_rate_mb_s"):
+            return
+        recent = _median([h for _, h in pts[-3:]])
+        m["eta_s"] = max(0.0, recent / rate)
+
+
+# --------------------------------------------------------------------------
+# Rule evaluation
+# --------------------------------------------------------------------------
+
+class Debounce:
+    def __init__(self):
+        self.w_since = None
+        self.c_since = None
+
+    def update(self, raw, now, warn_hold, crit_hold):
+        if raw >= 1:
+            if self.w_since is None:
+                self.w_since = now
+        else:
+            self.w_since = None
+        if raw >= 2:
+            if self.c_since is None:
+                self.c_since = now
+        else:
+            self.c_since = None
+        if raw >= 2 and now - self.c_since >= crit_hold:
+            return 2
+        if raw >= 1 and now - self.w_since >= warn_hold:
+            return 1
+        return 0
+
+
+# Display priority of reasons (first = most important)
+PRIORITY = ["oom", "combo", "mem_trend", "mem_psi", "swap", "reclaim", "mem_avail",
+            "io_psi", "io_blocked", "disk_util", "cpu_psi", "cpu_load"]
+CAT_NAMES = {"memory": "memory", "io": "I/O", "cpu": "CPU"}
+
+
+class Evaluator:
+    def __init__(self, cfg, ncpu):
+        self.cfg = cfg
+        self.ncpu = ncpu
+        self.trend = Trend(cfg)
+        c = cfg
+        # key, category, function, warn_hold, crit_hold
+        self.rules = [
+            ("mem_trend", "memory", self.r_trend, c.f("trend", "warn_hold"), c.f("trend", "crit_hold")),
+            ("mem_psi", "memory", self.r_mem_psi, c.f("memory", "psi_some_warn_hold"), c.f("memory", "psi_crit_hold")),
+            ("mem_avail", "memory", self.r_mem_avail, c.f("memory", "avail_warn_hold"), c.f("memory", "avail_crit_hold")),
+            ("swap", "memory", self.r_swap, c.f("swap", "warn_hold"), c.f("swap", "crit_hold")),
+            ("reclaim", "memory", self.r_reclaim, c.f("reclaim", "warn_hold"), 0),
+            ("oom", "memory", self.r_oom, 0, 0),
+            ("io_psi", "io", self.r_io_psi, c.f("io", "psi_warn_hold"), c.f("io", "psi_crit_hold")),
+            ("io_blocked", "io", self.r_blocked, c.f("io", "blocked_warn_hold"), c.f("io", "blocked_crit_hold")),
+            ("disk_util", "io", self.r_disk, c.f("io", "util_warn_hold"), c.f("io", "util_crit_hold")),
+            ("cpu_psi", "cpu", self.r_cpu_psi, c.f("cpu", "psi_warn_hold"), c.f("cpu", "crit_hold")),
+            ("cpu_load", "cpu", self.r_cpu_load, c.f("cpu", "load_warn_hold"), 0),
+        ]
+        self.deb = {r[0]: Debounce() for r in self.rules}
+        self.space_deb = {}
+
+    # --- memory ---
+    def r_trend(self, m):
+        eta = m.get("eta_s")
+        if eta is None:
+            return 0, ""
+        rate = -(m.get("mem_slope_mb_s") or 0.0)
+        if eta <= 0:
+            msg = "RAM+swap headroom exhausted (available %s, still falling %.0f MB/s)" % (
+                gb(m["mem_avail_mb"]), rate)
+        else:
+            msg = "RAM exhaustion predicted in %s (available %s, falling %.0f MB/s)" % (
+                fmt_eta(eta), gb(m["mem_avail_mb"]), rate)
+        if eta < self.cfg.f("trend", "crit_eta"):
+            return 2, msg
+        if eta < self.cfg.f("trend", "warn_eta"):
+            return 1, msg
+        return 0, ""
+
+    def r_mem_psi(self, m):
+        c = self.cfg
+        some, full = m["psi_mem_some10"], m["psi_mem_full10"]
+        msg = "memory pressure: tasks stalled %.0f%% of time (PSI some), all tasks %.0f%% (full)" % (some, full)
+        if some > c.f("memory", "psi_some_crit") or full > c.f("memory", "psi_full_crit"):
+            return 2, msg
+        if some > c.f("memory", "psi_some_warn"):
+            return 1, msg
+        return 0, ""
+
+    def r_mem_avail(self, m):
+        c = self.cfg
+        pct = m["mem_avail_pct"]
+        if pct < c.f("memory", "avail_crit_pct"):
+            return 2, "available RAM critically low: %s (%.1f%%)" % (gb(m["mem_avail_mb"]), pct)
+        if pct < c.f("memory", "avail_warn_pct"):
+            return 1, "available RAM below %g%%: %s (%.1f%%)" % (
+                c.f("memory", "avail_warn_pct"), gb(m["mem_avail_mb"]), pct)
+        return 0, ""
+
+    def r_swap(self, m):
+        c = self.cfg
+        tot = m["swap_total_mb"]
+        if tot <= 0:
+            return 0, ""
+        used_pct = 100.0 * m["swap_used_mb"] / tot
+        act = m["swapin_mb_s"] + m["swapout_mb_s"]
+        msg = "swap %.2f/%.2f GB used (%.0f%%), swap-in %.1f / swap-out %.1f MB/s" % (
+            m["swap_used_mb"] / 1024, tot / 1024, used_pct, m["swapin_mb_s"], m["swapout_mb_s"])
+        if used_pct > c.f("swap", "used_crit_pct") and m["mem_avail_pct"] < c.f("memory", "avail_warn_pct"):
+            return 2, msg
+        if (used_pct > c.f("swap", "used_warn_pct") and m["swapout_mb_s"] > c.f("swap", "swapout_warn_mb_s")) \
+                or act > c.f("swap", "activity_warn_mb_s"):
+            return 1, msg
+        return 0, ""
+
+    def r_reclaim(self, m):
+        c = self.cfg
+        hit = (m["refault_s"] > c.f("reclaim", "refault_warn_pages_s")
+               or m["allocstall_s"] > c.f("reclaim", "allocstall_warn_s")
+               or m["pgscan_direct_s"] > c.f("reclaim", "pgscan_direct_warn_pages_s")
+               or m["majflt_s"] > c.f("reclaim", "majfault_warn_s"))
+        if not hit:
+            return 0, ""
+        return 1, ("memory thrashing/reclaim: %.0f refaults/s, %.0f direct-reclaim stalls/s, "
+                   "%.0f major faults/s" % (m["refault_s"], m["allocstall_s"], m["majflt_s"]))
+
+    def r_oom(self, m):
+        if m.get("oom_kills", 0) > 0:
+            return 2, "kernel OOM killer fired (%d kill%s)" % (m["oom_kills"], "" if m["oom_kills"] == 1 else "s")
+        return 0, ""
+
+    # --- io ---
+    def r_io_psi(self, m):
+        c = self.cfg
+        some, full = m["psi_io_some10"], m["psi_io_full10"]
+        msg = "I/O pressure: all tasks stalled on I/O %.0f%% of time (PSI full), some %.0f%%" % (full, some)
+        if full > c.f("io", "psi_full_crit"):
+            return 2, msg
+        if full > c.f("io", "psi_full_warn") or some > c.f("io", "psi_some_warn"):
+            return 1, msg
+        return 0, ""
+
+    def r_blocked(self, m):
+        c = self.cfg
+        n = m["procs_blocked"]
+        msg = "%d tasks blocked waiting for I/O (D-state)" % n
+        if n >= c.f("io", "blocked_crit"):
+            return 2, msg
+        if n >= c.f("io", "blocked_warn"):
+            return 1, msg
+        return 0, ""
+
+    def r_disk(self, m):
+        c = self.cfg
+        u, w = m["disk_util"], m["iowait_pct"]
+        msg = "disk %s saturated: %.0f%% busy, iowait %.0f%%, await %.0f ms" % (
+            m["disk_dev"], u, w, m["disk_await_ms"])
+        if u >= c.f("io", "util_crit") and w > c.f("io", "iowait_crit"):
+            return 2, msg
+        if u > c.f("io", "util_warn") and w > c.f("io", "iowait_warn"):
+            return 1, msg
+        return 0, ""
+
+    # --- cpu ---
+    def r_cpu_psi(self, m):
+        c = self.cfg
+        msg = "CPU pressure: tasks waiting for CPU %.0f%% of time (PSI some, 60 s avg), load %.1f on %d CPUs" % (
+            m["psi_cpu_some60"], m["load1"], self.ncpu)
+        if m["psi_cpu_some10"] > c.f("cpu", "psi_some_crit") and m["load1"] > c.f("cpu", "load_crit_factor") * self.ncpu:
+            return 2, msg
+        if m["psi_cpu_some60"] > c.f("cpu", "psi_some_avg60_warn"):
+            return 1, msg
+        return 0, ""
+
+    def r_cpu_load(self, m):
+        if m["load1"] > self.cfg.f("cpu", "load_warn_factor") * self.ncpu:
+            return 1, "load average %.1f on %d CPUs" % (m["load1"], self.ncpu)
+        return 0, ""
+
+    # --- space ---
+    def space(self, m, now):
+        c = self.cfg
+        reasons = {}
+        for mp, v in (m.get("fs") or {}).items():
+            if not v:
+                continue
+            gb_rules = v["size_gb"] >= c.f("space", "gb_rules_min_size_gb")
+            lvl = 0
+            if v["pct"] > c.f("space", "crit_used_pct") or (gb_rules and v["free_gb"] < c.f("space", "crit_free_gb")):
+                lvl = 2
+            elif v["pct"] > c.f("space", "warn_used_pct") or (gb_rules and v["free_gb"] < c.f("space", "warn_free_gb")):
+                lvl = 1
+            if lvl:
+                reasons["fs:" + mp] = (lvl, "space", "%s is %.1f%% full (%.1f GB free)" % (mp, v["pct"], v["free_gb"]))
+        return (max([r[0] for r in reasons.values()] or [0]), reasons)
+
+    def evaluate(self, m, now):
+        self.trend.update(now, m)
+        reasons = {}
+        for key, cat, fn, wh, ch in self.rules:
+            raw, msg = fn(m)
+            lvl = self.deb[key].update(raw, now, wh, ch)
+            if lvl:
+                reasons[key] = (lvl, cat, msg)
+        cats = [cat for cat in ("memory", "io", "cpu") if any(r[1] == cat for r in reasons.values())]
+        if self.cfg.b("combination", "enabled") and len(cats) >= self.cfg.i("combination", "min_categories"):
+            reasons["combo"] = (2, "combo", "combined pressure: " + " + ".join(CAT_NAMES[x] for x in cats))
+        level = max([r[0] for r in reasons.values()] or [0])
+        return level, reasons
+
+
+def ordered_keys(reasons):
+    def k(key):
+        base = key if key in PRIORITY else ("zz" + key)
+        return (-reasons[key][0], PRIORITY.index(base) if base in PRIORITY else 99, key)
+    return sorted(reasons, key=k)
+
+
+# --------------------------------------------------------------------------
+# State machine with anti-spam logic
+# --------------------------------------------------------------------------
+
+class Channel:
+    """Per-channel state machine.
+
+    Notifies on entering WARNING, entering CRITICAL and on RECOVERY. Never
+    repeats while the state is unchanged. Inside a WARNING episode, a signal
+    that was not active before (e.g. the RAM-exhaustion prediction) produces
+    one UPDATE notification, rate-limited to `update_interval`.
+    """
+
+    def __init__(self, name, recovery_hold, flap_guard, update_interval):
+        self.name = name
+        self.recovery_hold = recovery_hold
+        self.flap_guard = flap_guard
+        self.update_interval = update_interval
+        self.state = 0
+        self.below_since = None
+        self.last_recovery = -1e18
+        self.last_notify = -1e18
+        self.last_crit_notify = -1e18
+        self.ep_start = None
+        self.ep_peak = 0
+        self.ep_notified = False
+        self.seen = set()
+
+    def update(self, now, level, reasons):
+        out = []
+        active = set(reasons)
+        if level > self.state:
+            if self.state == 0:
+                self.ep_start = now
+                self.ep_peak = 0
+                self.ep_notified = False
+                self.seen = set()
+            if level == 2:
+                kind = "CRITICAL"
+                notify = (now - self.last_crit_notify) >= self.flap_guard
+                if notify:
+                    self.last_crit_notify = now
+            else:
+                kind = "WARNING"
+                notify = (now - self.last_recovery) >= self.flap_guard
+            self.state = level
+            self.ep_peak = max(self.ep_peak, level)
+            self.below_since = None
+            self.seen |= active
+            if notify:
+                self.ep_notified = True
+                self.last_notify = now
+            out.append((kind, notify, sorted(active)))
+        elif level < self.state:
+            if self.below_since is None:
+                self.below_since = now
+            if now - self.below_since >= self.recovery_hold:
+                if level == 0:
+                    out.append(("RECOVERY", self.ep_notified, []))
+                    if self.ep_notified:
+                        self.last_notify = now
+                    self.state = 0
+                    self.last_recovery = now
+                else:
+                    self.state = level
+                    out.append(("DOWNGRADE", False, sorted(active)))
+                self.below_since = None
+        else:
+            self.below_since = None
+        if self.state == 1 and not out:
+            new = active - self.seen
+            if new and now - self.last_notify >= self.update_interval:
+                self.seen |= new
+                self.last_notify = now
+                self.ep_notified = True
+                out.append(("UPDATE", True, sorted(new)))
+        return out
+
+
+# --------------------------------------------------------------------------
+# Event / message construction
+# --------------------------------------------------------------------------
+
+def mem_block(m):
+    lines = [
+        "Available: %s (%.1f%%)" % (gb(m["mem_avail_mb"]), m["mem_avail_pct"]),
+        "Anonymous: %s" % gb(m["anon_mb"]),
+        "Shmem: %s" % gb(m["shmem_mb"]),
+        "Page cache: %s" % gb(m["cache_mb"]),
+        "Kernel: %s" % gb(m["kernel_mb"]),
+        "Swap: %.2f/%.2f GB" % (m["swap_used_mb"] / 1024, m["swap_total_mb"] / 1024),
+        "Swap-in/out: %.1f / %.1f MB/s" % (m["swapin_mb_s"], m["swapout_mb_s"]),
+        "Memory PSI: %.0f%% (full %.0f%%)" % (m["psi_mem_some10"], m["psi_mem_full10"]),
+    ]
+    if m.get("eta_s") is not None:
+        lines.append("Predicted exhaustion: %s" % fmt_eta(m["eta_s"]))
+    return lines
+
+
+def io_block(m):
+    return ["I/O PSI: full %.0f%%, some %.0f%%" % (m["psi_io_full10"], m["psi_io_some10"]),
+            "iowait: %.0f%%, disk %s util: %.0f%%, await %.0f ms" % (
+                m["iowait_pct"], m["disk_dev"], m["disk_util"], m["disk_await_ms"]),
+            "Blocked tasks (D): %d" % m["procs_blocked"]]
+
+
+def cpu_block(m):
+    return ["CPU: %.0f%% busy, PSI some %.0f%% (60 s %.0f%%), load %.1f/%.1f/%.1f on %d CPUs" % (
+        m["cpu_pct"], m["psi_cpu_some10"], m["psi_cpu_some60"], m["load1"], m["load5"], m["load15"], m["ncpu"])]
+
+
+def build_event(channel, kind, notify, keys, reasons, m, ch):
+    ts = time.time()
+    ev = {"ts": ts, "time": now_str(ts), "channel": channel.name, "kind": kind, "notify": notify,
+          "state": LEVEL_NAMES[channel.state],
+          "reasons": {k: reasons[k][2] for k in ordered_keys(reasons)}}
+    shown = [k for k in ordered_keys(reasons) if k in keys] if kind == "UPDATE" else ordered_keys(reasons)
+    msgs = [reasons[k][2] for k in shown]
+    cats = set(r[1] for r in reasons.values())
+    if channel.name == "space":
+        if kind == "RECOVERY":
+            ev.update(title="Disk space OK again", body="All monitored filesystems are below the warning level.",
+                      urgency="low")
+        else:
+            first = msgs[0] if msgs else "disk space"
+            ev.update(title="Disk space %s: %s" % (kind if kind != "UPDATE" else "WARNING", first.split(" (")[0]),
+                      body="\n".join(msgs), urgency="critical" if kind == "CRITICAL" else "normal")
+        return ev
+    if kind == "RECOVERY":
+        dur = (ch.last_recovery - ch.ep_start) if ch.ep_start is not None else 0
+        ev.update(title="RECOVERY: system resources back to normal",
+                  body="Pressure episode lasted %s, peak level %s.\nDetails: sysmon events / sysmon history" % (
+                      fmt_dur(dur), LEVEL_NAMES[ch.ep_peak]),
+                  urgency="low")
+        return ev
+    if kind == "CRITICAL":
+        if "combo" in reasons:
+            head = "system stall risk - " + reasons["combo"][2]
+        elif "oom" in reasons:
+            head = "kernel OOM killer activated"
+        elif "memory" in cats:
+            head = "severe memory pressure"
+        elif "io" in cats:
+            head = "disk I/O saturation"
+        else:
+            head = "CPU saturation"
+        title = "CRITICAL: " + head
+        urgency = "critical"
+    else:
+        lead = msgs[0].split(" (")[0].split(":")[0] if msgs else "resource pressure"
+        title = ("WARNING (update): " if kind == "UPDATE" else "WARNING: ") + lead
+        urgency = "normal"
+    body = [x for x in msgs if x and not x.startswith("combined pressure")][:4]
+    if "memory" in cats:
+        body += [""] + mem_block(m)
+    if "io" in cats:
+        body += [""] + io_block(m)
+    if "cpu" in cats:
+        body += [""] + cpu_block(m)
+    ev.update(title=title, body="\n".join(body).strip(), urgency=urgency)
+    return ev
+
+
+# --------------------------------------------------------------------------
+# Kernel log reader (/dev/kmsg, non-blocking, no fork)
+# --------------------------------------------------------------------------
+
+KMSG_KEYWORDS = ("oom", "out of memory", "hung_task", "blocked for more than", "i/o error",
+                 "soft lockup", "hard lockup", "ext4-fs error", "nvme", "page allocation failure",
+                 "call trace", "rcu_sched", "watchdog")
+
+
+class KmsgReader:
+    def __init__(self):
+        self.fd = None
+        self.ring = collections.deque(maxlen=300)
+        try:
+            self.fd = os.open("/dev/kmsg", os.O_RDONLY | os.O_NONBLOCK)
+            os.lseek(self.fd, 0, os.SEEK_END)
+        except OSError:
+            self.fd = None
+
+    def drain(self):
+        if self.fd is None:
+            return
+        for _ in range(2000):
+            try:
+                rec = os.read(self.fd, 8192)
+            except BlockingIOError:
+                return
+            except BrokenPipeError:
+                continue  # records overwritten; continue with next
+            except OSError:
+                return
+            if not rec:
+                return
+            line = rec.decode("utf-8", "replace").split("\n", 1)[0]
+            head, _, msg = line.partition(";")
+            try:
+                pri = int(head.split(",")[0]) & 7
+            except ValueError:
+                pri = 6
+            low = msg.lower()
+            if pri <= 4 or any(k in low for k in KMSG_KEYWORDS):
+                self.ring.append("%s <%d> %s" % (now_str(), pri, msg[:300]))
+
+
+# --------------------------------------------------------------------------
+# Async sinks (never block the sampling loop)
+# --------------------------------------------------------------------------
+
+class AsyncSink(threading.Thread):
+    def __init__(self, name, handler, maxsize=5000):
+        super().__init__(name=name, daemon=True)
+        self.q = queue.Queue(maxsize)
+        self.handler = handler
+        self.dropped = 0
+        self.errors = 0
+
+    def put(self, item):
+        try:
+            self.q.put_nowait(item)
+        except queue.Full:
+            self.dropped += 1
+
+    def run(self):
+        while True:
+            item = self.q.get()
+            if item is None:
+                return
+            try:
+                self.handler(item)
+            except Exception:
+                self.errors += 1
+
+
+def journal_handler(item):
+    prio, text = item
+    sys.stdout.write("<%d>%s\n" % (prio, text))
+    sys.stdout.flush()
+
+
+def fs_free_mb(path):
+    try:
+        st = os.statvfs(path)
+        return st.f_bavail * st.f_frsize / MB
+    except OSError:
+        return 1e12
+
+
+class HistoryStore:
+    """Hourly CSV files + events.log, with retention, size cap and disk-free guard."""
+
+    def __init__(self, cfg, directory, columns, journal):
+        self.cfg = cfg
+        self.dir = directory
+        self.columns = columns
+        self.header = ",".join(columns) + "\n"
+        self.journal = journal
+        self.cur_name = None
+        self.f = None
+        self.space_checked = -1e9
+        self.space_ok_cached = True
+        os.makedirs(self.dir, exist_ok=True)
+
+    def space_ok(self):
+        now = time.monotonic()
+        if now - self.space_checked > 60:
+            self.space_checked = now
+            ok = fs_free_mb(self.dir) >= self.cfg.f("history", "min_fs_free_mb")
+            if ok != self.space_ok_cached:
+                self.journal.put((4, "history writing %s (filesystem free space %s min_fs_free_mb)" % (
+                    "resumed" if ok else "PAUSED", "above" if ok else "below")))
+            self.space_ok_cached = ok
+        return self.space_ok_cached
+
+    def handle(self, item):
+        if item[0] == "hist":
+            self.write_hist(item[1], item[2])
+        elif item[0] == "event":
+            self.write_event(item[1])
+        elif item[0] == "cleanup":
+            self.cleanup()
+
+    def _open(self, base):
+        n = 0
+        while True:
+            name = base + (".%d" % n if n else "") + ".csv"
+            path = os.path.join(self.dir, name)
+            if not os.path.exists(path) or os.path.getsize(path) == 0:
+                break
+            with open(path) as f:
+                if f.readline() == self.header:
+                    break
+            n += 1
+        f = open(path, "a")
+        if f.tell() == 0:
+            f.write(self.header)
+        return name, f
+
+    def write_hist(self, epoch, line):
+        if not self.space_ok():
+            return
+        base = "history-" + time.strftime("%Y%m%d-%H", time.localtime(epoch))
+        if self.cur_name is None or not self.cur_name.startswith(base):
+            if self.f:
+                self.f.close()
+            self.cur_name, self.f = self._open(base)
+            self.cleanup()
+        self.f.write(line)
+        self.f.flush()
+        os.fdatasync(self.f.fileno())
+
+    def write_event(self, line):
+        if not self.space_ok():
+            return
+        path = os.path.join(self.dir, "events.log")
+        try:
+            if os.path.getsize(path) > 5 * MB:
+                os.replace(path, path + ".1")
+        except OSError:
+            pass
+        with open(path, "a") as f:
+            f.write(line)
+            f.flush()
+            os.fdatasync(f.fileno())
+
+    def cleanup(self):
+        files = sorted(glob.glob(os.path.join(self.dir, "history-*.csv")))
+        cutoff = time.time() - self.cfg.f("history", "retention_days") * 86400
+        cur = os.path.join(self.dir, self.cur_name) if self.cur_name else None
+        keep = []
+        for p in files:
+            try:
+                if os.path.getmtime(p) < cutoff and p != cur:
+                    os.unlink(p)
+                    continue
+                keep.append((p, os.path.getsize(p)))
+            except OSError:
+                pass
+        total = sum(s for _, s in keep)
+        limit = self.cfg.f("history", "max_total_mb") * MB
+        for p, s in keep:
+            if total <= limit:
+                break
+            if p == cur:
+                continue
+            try:
+                os.unlink(p)
+                total -= s
+            except OSError:
+                pass
+
+
+# --------------------------------------------------------------------------
+# Process inspection (used only for snapshots / alert enrichment)
+# --------------------------------------------------------------------------
+
+_uid_cache = {}
+
+
+def uname(uid):
+    if uid not in _uid_cache:
+        try:
+            _uid_cache[uid] = pwd.getpwuid(uid).pw_name
+        except KeyError:
+            _uid_cache[uid] = str(uid)
+    return _uid_cache[uid]
+
+
+def scan_processes(full=True):
+    procs = {}
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        pid = int(name)
+        base = "/proc/" + name
+        try:
+            s = read_text(base + "/stat")
+            l, r = s.find("("), s.rfind(")")
+            rest = s[r + 2:].split()
+            p = {"pid": pid, "comm": s[l + 1:r], "state": rest[0], "ppid": int(rest[1]),
+                 "cpu": int(rest[11]) + int(rest[12]), "threads": int(rest[17]),
+                 "start": int(rest[19]), "rss_kb": int(rest[21]) * PAGE // 1024}
+        except (OSError, ValueError, IndexError):
+            continue
+        try:
+            for line in read_text(base + "/io").splitlines():
+                k, _, v = line.partition(": ")
+                if k in ("read_bytes", "write_bytes"):
+                    p[k] = int(v)
+        except OSError:
+            pass
+        if full:
+            try:
+                st = read_kv(base + "/status")
+                p["anon_kb"] = st.get("RssAnon", 0)
+                p["shmem_kb"] = st.get("RssShmem", 0)
+                p["swap_kb"] = st.get("VmSwap", 0)
+                with open(base + "/status") as f:
+                    for line in f:
+                        if line.startswith("Uid:"):
+                            p["user"] = uname(int(line.split()[1]))
+                            break
+            except (OSError, ValueError):
+                pass
+        procs[pid] = p
+    return procs
+
+
+def d_state_tasks(procs, limit=60):
+    out = []
+    for pid, p in procs.items():
+        tids = []
+        if p.get("threads", 1) > 1:
+            try:
+                tids = [int(t) for t in os.listdir("/proc/%d/task" % pid)]
+            except OSError:
+                tids = []
+        else:
+            tids = [pid]
+        for tid in tids:
+            try:
+                s = read_text("/proc/%d/task/%d/stat" % (pid, tid))
+            except OSError:
+                continue
+            r = s.rfind(")")
+            if s[r + 2:r + 3] != "D":
+                continue
+            try:
+                wchan = read_text("/proc/%d/task/%d/wchan" % (pid, tid)).strip()
+            except OSError:
+                wchan = "?"
+            out.append((pid, tid, s[s.find("(") + 1:r], p.get("comm", "?"), wchan))
+            if len(out) >= limit:
+                return out
+    return out
+
+
+_cmdline_busy = threading.Event()
+
+
+def read_cmdlines(pids, timeout=1.0):
+    """Read cmdlines in a helper thread: /proc/PID/cmdline takes the target's
+    mmap lock and can block during memory thrashing, so never do it inline."""
+    res = {}
+    if _cmdline_busy.is_set():
+        return res
+
+    def worker():
+        _cmdline_busy.set()
+        try:
+            for pid in pids:
+                try:
+                    res[pid] = read_text("/proc/%d/cmdline" % pid).replace("\0", " ").strip()[:160]
+                except OSError:
+                    pass
+        finally:
+            _cmdline_busy.clear()
+
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+    t.join(timeout)
+    return dict(res)
+
+
+def tmpfs_usage():
+    out = []
+    try:
+        for line in read_text("/proc/mounts").splitlines():
+            p = line.split()
+            if len(p) > 2 and p[2] in ("tmpfs", "ramfs"):
+                try:
+                    st = os.statvfs(p[1])
+                except OSError:
+                    continue
+                used = (st.f_blocks - st.f_bfree) * st.f_frsize
+                if used > 16 * MB:
+                    out.append((used, p[1]))
+    except OSError:
+        pass
+    return sorted(out, reverse=True)
+
+
+def sysv_shm():
+    rows = []
+    try:
+        lines = read_text("/proc/sysvipc/shm").splitlines()
+        hdr = lines[0].split()
+        for line in lines[1:]:
+            v = dict(zip(hdr, line.split()))
+            rows.append((int(v.get("rss", v.get("size", 0))), int(v.get("size", 0)), int(v.get("cpid", 0)),
+                         int(v.get("nattch", 0))))
+    except (OSError, IndexError, ValueError):
+        pass
+    return rows
+
+
+def top_apps(procs, n=5):
+    agg = collections.defaultdict(int)
+    for p in procs.values():
+        agg[p["comm"]] += p.get("anon_kb", p["rss_kb"]) + p.get("swap_kb", 0)
+    return sorted(agg.items(), key=lambda x: -x[1])[:n]
+
+
+# --------------------------------------------------------------------------
+# Daemon
+# --------------------------------------------------------------------------
+
+HIST_BASE_COLS = [
+    "time", "epoch", "interval_s", "state", "space_state",
+    "mem_total_mb", "mem_avail_mb", "mem_avail_pct", "mem_free_mb", "anon_mb", "shmem_mb", "cache_mb",
+    "kernel_mb", "slab_unrecl_mb", "dirty_mb", "writeback_mb",
+    "swap_total_mb", "swap_used_mb", "swapin_mb_s", "swapout_mb_s", "majflt_s", "refault_s",
+    "allocstall_s", "pgscan_direct_s", "oom_kills",
+    "headroom_mb", "mem_slope_mb_s", "eta_s",
+    "psi_mem_some10", "psi_mem_full10", "psi_mem_some60", "psi_mem_full60", "psi_mem_some_int", "psi_mem_full_int",
+    "psi_io_some10", "psi_io_full10", "psi_io_some60", "psi_io_full60", "psi_io_full_int",
+    "psi_cpu_some10", "psi_cpu_some60", "psi_cpu_some_int",
+    "cpu_pct", "iowait_pct", "steal_pct", "load1", "load5", "load15",
+    "procs_running", "procs_blocked", "threads_total",
+    "disk_dev", "disk_util", "disk_r_mb_s", "disk_w_mb_s", "disk_await_ms",
+]
+
+
+def round_m(v):
+    if isinstance(v, float):
+        return round(v, 2)
+    return v
+
+
+class Daemon:
+    def __init__(self, cfg, args):
+        self.cfg = cfg
+        self.args = args
+        self.hist_dir = args.dir or cfg.s("history", "dir")
+        self.snap_dir = os.path.join(self.hist_dir, "snapshots")
+        self.run_dir = args.run_dir or RUN_DIR
+        self.stop = threading.Event()
+        self.force_snapshot = False
+        self.collector = Collector(cfg)
+        self.ev = Evaluator(cfg, self.collector.ncpu)
+        self.pressure = Channel("pressure", cfg.f("general", "recovery_hold"), cfg.f("notify", "flap_guard"),
+                                cfg.f("notify", "update_interval"))
+        self.space = Channel("space", cfg.f("space", "recovery_hold"), 3600, 3600)
+        self.columns = HIST_BASE_COLS + sum(
+            [["fs_%s_pct" % fs_key(mp), "fs_%s_free_gb" % fs_key(mp)] for mp in self.collector.filesystems], []
+        ) + ["reasons"]
+        self.kmsg = KmsgReader()
+        self.recent = collections.deque(maxlen=36)
+        self.emit_lock = threading.Lock()
+        self.snap_q = queue.Queue(4)
+        self.snap_busy_since = None
+        self.last_periodic = -1e18
+
+    def log(self, prio, text):
+        self.journal.put((prio, text))
+
+    # ---- event emission ----
+    def emit(self, ev):
+        line = json.dumps(ev, ensure_ascii=False)
+        with self.emit_lock:
+            path = os.path.join(self.run_dir, "events.jsonl")
+            try:
+                if os.path.exists(path) and os.path.getsize(path) > 256 * 1024:
+                    with open(path) as f:
+                        keep = f.readlines()[-200:]
+                    tmp = path + ".tmp"
+                    with open(tmp, "w") as f:
+                        f.writelines(keep)
+                    os.chmod(tmp, 0o644)
+                    os.replace(tmp, path)
+                with open(path, "a") as f:
+                    f.write(line + "\n")
+                os.chmod(path, 0o644)
+            except OSError as e:
+                self.log(3, "cannot write %s: %s" % (path, e))
+        self.store.put(("event", line + "\n"))
+        prio = {"CRITICAL": 2, "WARNING": 4, "UPDATE": 4, "RECOVERY": 5}.get(ev["kind"], 6)
+        self.log(prio, "%s [%s] %s | %s%s" % (ev["kind"], ev["channel"], ev["title"],
+                                             ev["body"].replace("\n", "; "),
+                                             "" if ev["notify"] else " (notification suppressed: anti-flap)"))
+        if ev["kind"] == "CRITICAL" and ev["notify"] and self.cfg.b("notify", "wall_on_critical"):
+            msg = "sysmon %s\n%s\n%s" % (ev["time"], ev["title"], ev["body"])
+            threading.Thread(target=self._wall, args=(msg,), daemon=True).start()
+
+    @staticmethod
+    def _wall(msg):
+        try:
+            subprocess.run(["wall"], input=msg.encode(), timeout=30,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
+    def dispatch(self, ev, m, reasons):
+        job = {"event": ev, "m": dict(m), "reasons": dict(reasons), "state": ev["state"],
+               "kmsg": list(self.kmsg.ring), "recent": list(self.recent), "label": ev["kind"]}
+        stuck = self.snap_busy_since is not None and time.monotonic() - self.snap_busy_since > 30
+        wants_snapshot = ev["kind"] in ("WARNING", "CRITICAL", "UPDATE")
+        if wants_snapshot and not stuck and self.snap_q.empty():
+            try:
+                self.snap_q.put_nowait(job)
+                return
+            except queue.Full:
+                pass
+        self.emit(ev)  # emit directly (no enrichment)
+        if wants_snapshot and not stuck:
+            job["event"] = None
+            try:
+                self.snap_q.put_nowait(job)
+            except queue.Full:
+                pass
+
+    # ---- snapshot worker ----
+    def snapshot_worker(self):
+        while True:
+            job = self.snap_q.get()
+            if job is None:
+                return
+            self.snap_busy_since = time.monotonic()
+            try:
+                self.take_snapshot(job)
+            except Exception as e:
+                self.log(3, "snapshot failed: %r" % (e,))
+                if job.get("event"):
+                    self.emit(job["event"])
+            finally:
+                self.snap_busy_since = None
+
+    def take_snapshot(self, job):
+        n = self.cfg.i("snapshots", "top_n")
+        t1 = time.monotonic()
+        p1 = scan_processes(full=True)
+        time.sleep(1.0)
+        t2 = time.monotonic()
+        p2 = scan_processes(full=False)
+        dt = max(1e-3, t2 - t1)
+        for pid, p in p2.items():
+            q = p1.get(pid)
+            if q and q["start"] == p["start"]:
+                p["cpu_pct"] = 100.0 * (p["cpu"] - q["cpu"]) / CLK_TCK / dt
+                p["io_r"] = (p.get("read_bytes", 0) - q.get("read_bytes", 0)) / dt
+                p["io_w"] = (p.get("write_bytes", 0) - q.get("write_bytes", 0)) / dt
+                for k in ("anon_kb", "shmem_kb", "swap_kb", "user"):
+                    if k in q:
+                        p[k] = q[k]
+        m = job["m"]
+        ev = job.get("event")
+        apps = top_apps(p1)
+        top_cpu = sorted((p for p in p2.values() if "cpu_pct" in p), key=lambda p: -p["cpu_pct"])[:n]
+        top_io = sorted((p for p in p2.values() if "io_r" in p), key=lambda p: -(p["io_r"] + p["io_w"]))[:n]
+        if ev is not None:
+            cats = set(r[1] for r in job["reasons"].values())
+            extra = []
+            if "memory" in cats or not cats:
+                extra.append("Top memory: " + ", ".join("%s %s" % (c, gb(kb / 1024.0)) for c, kb in apps[:3]))
+            if "io" in cats:
+                extra.append("Top I/O: " + ", ".join("%s %.0f MB/s" % (p["comm"], (p["io_r"] + p["io_w"]) / MB)
+                                                     for p in top_io[:3] if p["io_r"] + p["io_w"] > 0) or "-")
+            if "cpu" in cats:
+                extra.append("Top CPU: " + ", ".join("%s %.0f%%" % (p["comm"], p["cpu_pct"]) for p in top_cpu[:3]))
+            if extra:
+                ev["body"] = ev["body"] + "\n\n" + "\n".join(extra)
+            self.emit(ev)
+
+        if fs_free_mb(self.hist_dir) < self.cfg.f("history", "min_fs_free_mb"):
+            self.log(4, "snapshot skipped: low free space on log filesystem")
+            return
+        top_rss = sorted(p1.values(), key=lambda p: -(p.get("anon_kb", p["rss_kb"]) + p.get("shmem_kb", 0)))[:n]
+        top_swap = sorted((p for p in p1.values() if p.get("swap_kb")), key=lambda p: -p["swap_kb"])[:10]
+        dtasks = d_state_tasks(p2)
+        cmd = read_cmdlines([p["pid"] for p in top_rss + top_cpu + top_io][:3 * n])
+        states = collections.Counter(p["state"] for p in p2.values())
+        L = []
+        w = L.append
+        w("sysmon snapshot  %s  (%s)" % (now_str(), job["label"]))
+        w("host %s  kernel %s  uptime %s" % (socket.gethostname(), os.uname().release,
+                                              fmt_dur(float(read_text("/proc/uptime").split()[0]))))
+        w("pressure state: %s   space state: %s" % (LEVEL_NAMES[self.pressure.state], LEVEL_NAMES[self.space.state]))
+        w("")
+        w("== Active signals ==")
+        for k in ordered_keys(job["reasons"]):
+            lvl, cat, msg = job["reasons"][k]
+            w("  [%s] %-10s %s" % (LEVEL_NAMES[lvl], k, msg))
+        if not job["reasons"]:
+            w("  (none)")
+        w("")
+        w("== Memory ==")
+        for line in mem_block(m):
+            w("  " + line)
+        w("  Total %s | free %s | dirty %.0f MB | writeback %.0f MB | slab unreclaimable %.0f MB" % (
+            gb(m["mem_total_mb"]), gb(m["mem_free_mb"]), m["dirty_mb"], m["writeback_mb"], m["slab_unrecl_mb"]))
+        w("  rates: swap-in %.1f MB/s, swap-out %.1f MB/s, major faults %.0f/s, refaults %.0f/s, "
+          "direct-reclaim stalls %.0f/s, pgscan_direct %.0f/s, OOM kills %d" % (
+              m["swapin_mb_s"], m["swapout_mb_s"], m["majflt_s"], m["refault_s"], m["allocstall_s"],
+              m["pgscan_direct_s"], m["oom_kills"]))
+        slope = m.get("mem_slope_mb_s")
+        w("  trend: headroom %s, slope %s MB/s, predicted exhaustion %s" % (
+            gb(m.get("headroom_mb", 0)), "%.1f" % slope if slope is not None else "-", fmt_eta(m.get("eta_s"))))
+        tf = tmpfs_usage()
+        if tf:
+            w("  tmpfs usage: " + ", ".join("%s %s" % (mp, gb(u / MB)) for u, mp in tf[:8]))
+        shm = sysv_shm()
+        if shm:
+            w("  SysV shm: %d segments, %s resident" % (len(shm), gb(sum(r[0] for r in shm) / MB)))
+        w("")
+        w("== Pressure (PSI avg10 / avg60, %; interval = measured over last sample) ==")
+        for res in ("mem", "io", "cpu"):
+            w("  %-4s some %5.1f / %5.1f   full %5.1f / %5.1f   interval some %5.1f" % (
+                res, m["psi_%s_some10" % res], m["psi_%s_some60" % res], m["psi_%s_full10" % res],
+                m["psi_%s_full60" % res], m["psi_%s_some_int" % res]))
+        w("")
+        w("== CPU / load ==")
+        w("  CPU %.1f%%  iowait %.1f%%  steal %.1f%%  load %.2f %.2f %.2f on %d CPUs" % (
+            m["cpu_pct"], m["iowait_pct"], m["steal_pct"], m["load1"], m["load5"], m["load15"], m["ncpu"]))
+        w("  procs_running %d  procs_blocked %d  processes %d  threads %d  states %s" % (
+            m["procs_running"], m["procs_blocked"], len(p2), m["threads_total"],
+            " ".join("%s=%d" % kv for kv in sorted(states.items()))))
+        w("")
+        w("== Disks ==")
+        for name, d in sorted(m.get("disks", {}).items()):
+            w("  %-10s util %5.1f%%  read %7.1f MB/s  write %7.1f MB/s  await %6.1f ms  in-flight %d" % (
+                name, d["util"], d["r_mb_s"], d["w_mb_s"], d["await_ms"], d["inflight"]))
+        for mp, v in sorted((m.get("fs") or {}).items()):
+            if v:
+                w("  fs %-10s %5.1f%% used, %.1f GB free of %.1f GB" % (mp, v["pct"], v["free_gb"], v["size_gb"]))
+        w("")
+        w("== Top memory by application (anon RSS + swap, summed per name) ==")
+        for c, kb in top_apps(p1, n):
+            w("  %9s  %s" % (gb(kb / 1024.0), c))
+        w("")
+        w("== Top %d processes by memory ==" % n)
+        w("  %7s %-10s %9s %9s %9s %9s  %s" % ("PID", "USER", "ANON", "SHMEM", "SWAP", "RSS", "COMMAND"))
+        for p in top_rss:
+            w("  %7d %-10s %8.0fM %8.0fM %8.0fM %8.0fM  %s" % (
+                p["pid"], p.get("user", "?")[:10], p.get("anon_kb", 0) / 1024.0, p.get("shmem_kb", 0) / 1024.0,
+                p.get("swap_kb", 0) / 1024.0, p["rss_kb"] / 1024.0, cmd.get(p["pid"]) or p["comm"]))
+        if top_swap:
+            w("")
+            w("== Top swap users ==")
+            for p in top_swap:
+                w("  %7d %8.0fM  %s" % (p["pid"], p["swap_kb"] / 1024.0, p["comm"]))
+        w("")
+        w("== Top %d processes by CPU (measured over 1 s) ==" % n)
+        for p in top_cpu:
+            w("  %7d %6.1f%%  state %s  threads %4d  %s" % (
+                p["pid"], p["cpu_pct"], p["state"], p["threads"], cmd.get(p["pid"]) or p["comm"]))
+        w("")
+        w("== Top %d processes by disk I/O (measured over 1 s) ==" % n)
+        if os.geteuid() != 0:
+            w("  (not root: only own processes visible)")
+        for p in top_io:
+            if p["io_r"] + p["io_w"] <= 0:
+                continue
+            w("  %7d  read %7.1f MB/s  write %7.1f MB/s  %s" % (
+                p["pid"], p["io_r"] / MB, p["io_w"] / MB, cmd.get(p["pid"]) or p["comm"]))
+        w("")
+        w("== Tasks in D state (uninterruptible): %d ==" % len(dtasks))
+        for pid, tid, tcomm, pcomm, wchan in dtasks:
+            w("  pid %7d tid %7d  %-16s (%s)  wchan=%s" % (pid, tid, tcomm, pcomm, wchan))
+        w("")
+        w("== Recent samples (oldest first) ==")
+        w("  %-8s %8s %8s %8s %7s %6s %6s %6s %6s %5s %5s %6s" % (
+            "time", "availMB", "swapMB", "swpoMB/s", "reflt/s", "mPSI", "mFULL", "ioFULL", "cpu%", "iow%",
+            "blk", "eta"))
+        for r in job["recent"]:
+            w("  %-8s %8.0f %8.0f %8.1f %7.0f %6.1f %6.1f %6.1f %6.1f %5.1f %5d %6s" % (
+                time.strftime("%H:%M:%S", time.localtime(r["epoch"])), r["mem_avail_mb"], r["swap_used_mb"],
+                r["swapout_mb_s"], r["refault_s"], r["psi_mem_some10"], r["psi_mem_full10"], r["psi_io_full10"],
+                r["cpu_pct"], r["iowait_pct"], r["procs_blocked"], fmt_eta(r.get("eta_s"))))
+        w("")
+        w("== Kernel warnings (recent, from /dev/kmsg) ==")
+        for line in job["kmsg"][-80:] or ["  (none since monitor start)"]:
+            w("  " + line)
+        w("")
+        w("== Raw /proc/meminfo ==")
+        try:
+            w(read_text("/proc/meminfo").rstrip())
+        except OSError:
+            pass
+        w("")
+        w("== Selected /proc/vmstat counters ==")
+        try:
+            for line in read_text("/proc/vmstat").splitlines():
+                if line.startswith(("pswp", "pgmajfault", "pgscan", "pgsteal", "allocstall", "workingset",
+                                    "oom_kill", "compact_stall", "nr_dirty", "nr_writeback", "thp_fault",
+                                    "nr_shmem", "nr_anon", "nr_file_pages", "nr_free_pages")):
+                    w("  " + line)
+        except OSError:
+            pass
+        w("")
+        w("== Raw PSI / loadavg / diskstats ==")
+        for res in ("memory", "io", "cpu"):
+            try:
+                for line in read_text("/proc/pressure/" + res).splitlines():
+                    w("  %-6s %s" % (res, line))
+            except OSError:
+                pass
+        try:
+            w("  loadavg " + read_text("/proc/loadavg").strip())
+            for line in read_text("/proc/diskstats").splitlines():
+                if line.split()[2] in self.collector.disks:
+                    w("  " + line.strip())
+        except OSError:
+            pass
+        text = "\n".join(L) + "\n"
+        os.makedirs(self.snap_dir, exist_ok=True)
+        path = os.path.join(self.snap_dir, "%s-%s.txt" % (time.strftime("%Y%m%d-%H%M%S"), job["label"]))
+        with open(path, "w") as f:
+            f.write(text)
+            f.flush()
+            os.fdatasync(f.fileno())
+        self.log(6, "snapshot written: %s" % path)
+        self.cleanup_snapshots()
+
+    def cleanup_snapshots(self):
+        files = sorted(glob.glob(os.path.join(self.snap_dir, "*.txt")))
+        sizes = []
+        for p in files:
+            try:
+                sizes.append((p, os.path.getsize(p)))
+            except OSError:
+                pass
+        total = sum(s for _, s in sizes)
+        maxf = self.cfg.i("snapshots", "max_files")
+        maxb = self.cfg.f("snapshots", "max_total_mb") * MB
+        while sizes and (len(sizes) > maxf or total > maxb):
+            p, s = sizes.pop(0)
+            try:
+                os.unlink(p)
+            except OSError:
+                pass
+            total -= s
+
+    # ---- main loop ----
+    def write_state(self, m, preason, sreason):
+        st = {"ts": time.time(), "time": now_str(), "pid": os.getpid(), "version": VERSION,
+              "pressure": LEVEL_NAMES[self.pressure.state], "space": LEVEL_NAMES[self.space.state],
+              "reasons": {k: [LEVEL_NAMES[v[0]], v[1], v[2]] for k, v in list(preason.items()) + list(sreason.items())},
+              "metrics": {k: round_m(v) for k, v in m.items() if k not in ("disks",)},
+              "disks": m.get("disks", {}), "dropped": self.store_sink.dropped}
+        path = os.path.join(self.run_dir, "state.json")
+        tmp = path + ".tmp"
+        try:
+            with open(tmp, "w") as f:
+                json.dump(st, f)
+            os.chmod(tmp, 0o644)
+            os.replace(tmp, path)
+        except OSError:
+            pass
+
+    def history_line(self, m, preason, sreason):
+        row = dict(m)
+        row["time"] = now_str(m["epoch"])
+        row["epoch"] = int(m["epoch"])
+        row["state"] = LEVEL_NAMES[self.pressure.state]
+        row["space_state"] = LEVEL_NAMES[self.space.state]
+        row["reasons"] = "|".join(ordered_keys(dict(list(preason.items()) + list(sreason.items()))))
+        return ",".join(fmt_num(round_m(row.get(c))) for c in self.columns) + "\n"
+
+    def run(self):
+        threading.stack_size(512 * 1024)
+        os.makedirs(self.run_dir, exist_ok=True)
+        os.makedirs(self.hist_dir, exist_ok=True)
+        self.journal = AsyncSink("journal", journal_handler, 1000)
+        self.journal.start()
+        hs = HistoryStore(self.cfg, self.hist_dir, self.columns, self.journal)
+        self.store_sink = AsyncSink("history", hs.handle, 5000)
+        self.store = self.store_sink
+        self.store_sink.start()
+        self.store.put(("cleanup",))
+        threading.Thread(target=self.snapshot_worker, name="snapshot", daemon=True).start()
+
+        locked = "no"
+        if not self.args.no_mlock:
+            try:
+                libc = ctypes.CDLL(None, use_errno=True)
+                if libc.mlockall(1 | 2) == 0:  # MCL_CURRENT | MCL_FUTURE
+                    locked = "yes"
+                else:
+                    locked = "failed (errno %d)" % ctypes.get_errno()
+            except Exception as e:
+                locked = "failed (%s)" % e
+        with open(os.path.join(self.run_dir, "sysmon.pid"), "w") as f:
+            f.write(str(os.getpid()))
+        signal.signal(signal.SIGTERM, lambda *a: self.stop.set())
+        signal.signal(signal.SIGINT, lambda *a: self.stop.set())
+        signal.signal(signal.SIGUSR1, lambda *a: setattr(self, "force_snapshot", True))
+        psi_ok = os.path.exists("/proc/pressure/memory")
+        self.log(6, "sysmon %s started: interval %ss, disks %s, filesystems %s, PSI %s, mlock %s, config %s, history %s" % (
+            VERSION, fmt_num(self.cfg.f("general", "interval")), ",".join(self.collector.disks),
+            ",".join(self.collector.filesystems), "available" if psi_ok else "NOT AVAILABLE", locked,
+            self.cfg.loaded[0] if self.cfg.loaded else "defaults", self.hist_dir))
+        for u in self.cfg.unknown:
+            self.log(4, "unknown config option ignored: %s" % u)
+
+        interval = self.cfg.f("general", "interval")
+        crit_iv = self.cfg.f("snapshots", "critical_interval")
+        started = time.monotonic()
+        self.collector.sample()  # prime deltas
+        next_t = time.monotonic() + interval
+        last_cleanup = time.monotonic()
+        while not self.stop.is_set():
+            delay = next_t - time.monotonic()
+            if delay > 0 and self.stop.wait(delay):
+                break
+            now = time.monotonic()
+            next_t += interval
+            if next_t < now:
+                next_t = now + interval
+            try:
+                self.tick(now, interval, crit_iv)
+            except Exception as e:
+                self.log(3, "sample failed: %r" % (e,))
+            if now - last_cleanup > 3600:
+                last_cleanup = now
+                self.store.put(("cleanup",))
+            if self.args.duration and now - started >= self.args.duration:
+                break
+        self.log(6, "sysmon stopping")
+        time.sleep(0.3)
+
+    def tick(self, now, interval, crit_iv):
+        m = self.collector.sample()
+        if m is None:
+            return
+        if m["interval_s"] > 3 * interval:
+            self.log(4, "sampling was delayed: %.1f s since previous sample (system stall?)" % m["interval_s"])
+        self.kmsg.drain()
+        plevel, preason = self.ev.evaluate(m, now)
+        slevel, sreason = self.ev.space(m, now)
+        events = []
+        for kind, notify, keys in self.pressure.update(now, plevel, preason):
+            events.append(build_event(self.pressure, kind, notify, keys, preason, m, self.pressure))
+        for kind, notify, keys in self.space.update(now, slevel, sreason):
+            events.append(build_event(self.space, kind, notify, keys, sreason, m, self.space))
+        self.recent.append({k: m.get(k) for k in (
+            "epoch", "mem_avail_mb", "swap_used_mb", "swapout_mb_s", "refault_s", "psi_mem_some10",
+            "psi_mem_full10", "psi_io_full10", "cpu_pct", "iowait_pct", "procs_blocked", "eta_s")})
+        for ev in events:
+            if ev["kind"] == "DOWNGRADE":
+                self.log(5, "pressure downgraded to WARNING")
+                continue
+            self.dispatch(ev, m, preason if ev["channel"] == "pressure" else sreason)
+            if ev["kind"] == "CRITICAL":
+                self.last_periodic = now
+        if self.pressure.state == 2 and now - self.last_periodic >= crit_iv:
+            self.last_periodic = now
+            self._queue_snapshot(m, preason, "CRITICAL-periodic")
+        if self.force_snapshot:
+            self.force_snapshot = False
+            self._queue_snapshot(m, preason, "manual")
+        self.write_state(m, preason, sreason)
+        self.store.put(("hist", m["epoch"], self.history_line(m, preason, sreason)))
+
+    def _queue_snapshot(self, m, reasons, label):
+        try:
+            self.snap_q.put_nowait({"event": None, "m": dict(m), "reasons": dict(reasons), "label": label,
+                                    "kmsg": list(self.kmsg.ring), "recent": list(self.recent),
+                                    "state": LEVEL_NAMES[self.pressure.state]})
+        except queue.Full:
+            pass
+
+
+# --------------------------------------------------------------------------
+# Desktop notifier (runs in the user's session)
+# --------------------------------------------------------------------------
+
+def _escape(s):
+    return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def send_notification(title, body, urgency="normal"):
+    icon = {"critical": "dialog-error", "normal": "dialog-warning", "low": "dialog-information"}.get(urgency)
+    try:
+        r = subprocess.run(["notify-send", "-u", urgency, "-a", "sysmon", "-i", icon,
+                            _escape(title), _escape(body)], timeout=15,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def cmd_notify(args):
+    run_dir = args.run_dir or RUN_DIR
+    if args.test:
+        ok = send_notification("sysmon test notification",
+                               "If you can read this, desktop notifications work.\n"
+                               "CRITICAL alerts use critical urgency and stay on screen.", "normal")
+        print("sent" if ok else "notify-send failed")
+        return 0 if ok else 1
+    path = os.path.join(run_dir, "events.jsonl")
+    cursor = time.time() - 60
+    sig = None
+    daemon_down_notified = False
+    print("sysmon notifier watching %s" % path, flush=True)
+    while True:
+        try:
+            st = os.stat(path)
+            s = (st.st_ino, st.st_size, st.st_mtime)
+        except OSError:
+            s = None
+        if s and s != sig:
+            sig = s
+            try:
+                with open(path) as f:
+                    lines = f.readlines()
+            except OSError:
+                lines = []
+            for line in lines:
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    continue
+                if ev.get("ts", 0) <= cursor:
+                    continue
+                cursor = ev["ts"]
+                if ev.get("notify"):
+                    ok = send_notification(ev["title"], ev["body"], ev.get("urgency", "normal"))
+                    print("%s %s %s" % (ev.get("time"), "sent" if ok else "FAILED", ev["title"]), flush=True)
+        # watchdog: tell the user if the monitor itself stopped updating
+        try:
+            age = time.time() - os.stat(os.path.join(run_dir, "state.json")).st_mtime
+        except OSError:
+            age = 1e9
+        if age > 120 and not daemon_down_notified:
+            daemon_down_notified = True
+            send_notification("sysmon is not running",
+                              "The monitor has not updated its state for %s.\n"
+                              "Check: systemctl status sysmon" % (fmt_dur(age) if age < 1e8 else "a long time"),
+                              "normal")
+        elif age < 30 and daemon_down_notified:
+            daemon_down_notified = False
+        time.sleep(args.poll)
+
+
+# --------------------------------------------------------------------------
+# CLI viewers
+# --------------------------------------------------------------------------
+
+def cmd_status(args):
+    path = os.path.join(args.run_dir or RUN_DIR, "state.json")
+    try:
+        with open(path) as f:
+            st = json.load(f)
+    except (OSError, ValueError):
+        print("sysmon: no state file at %s - is the service running? (systemctl status sysmon)" % path)
+        return 1
+    m = st["metrics"]
+    age = time.time() - st["ts"]
+    print("sysmon %s   pressure: %s   disk space: %s%s" % (
+        st["time"], st["pressure"], st["space"],
+        "   (STALE: %s old - daemon stalled or stopped?)" % fmt_dur(age) if age > 30 else ""))
+    print("Memory  available %s (%.1f%%) | anon %s | shmem %s | cache %s | kernel %s" % (
+        gb(m["mem_avail_mb"]), m["mem_avail_pct"], gb(m["anon_mb"]), gb(m["shmem_mb"]), gb(m["cache_mb"]),
+        gb(m["kernel_mb"])))
+    slope = m.get("mem_slope_mb_s")
+    print("        swap %.2f/%.2f GB | in %.1f / out %.1f MB/s | refaults %.0f/s | major faults %.0f/s" % (
+        m["swap_used_mb"] / 1024, m["swap_total_mb"] / 1024, m["swapin_mb_s"], m["swapout_mb_s"],
+        m["refault_s"], m["majflt_s"]))
+    print("        trend %s MB/s | predicted exhaustion: %s" % (
+        "%+.1f" % slope if slope is not None else "(warming up)",
+        fmt_eta(m.get("eta_s")) if m.get("eta_s") is not None else "none"))
+    print("PSI     memory some %.1f full %.1f | io some %.1f full %.1f | cpu some %.1f   (avg10 %%)" % (
+        m["psi_mem_some10"], m["psi_mem_full10"], m["psi_io_some10"], m["psi_io_full10"], m["psi_cpu_some10"]))
+    print("CPU     %.1f%% busy | iowait %.1f%% | load %.2f %.2f %.2f on %d CPUs | blocked tasks %d" % (
+        m["cpu_pct"], m["iowait_pct"], m["load1"], m["load5"], m["load15"], m["ncpu"], m["procs_blocked"]))
+    for name, d in sorted(st.get("disks", {}).items()):
+        print("Disk    %s util %.0f%% | read %.1f write %.1f MB/s | await %.1f ms" % (
+            name, d["util"], d["r_mb_s"], d["w_mb_s"], d["await_ms"]))
+    fs = m.get("fs") or {}
+    print("Space   " + " | ".join("%s %.1f%% (%.1f GB free)" % (mp, v["pct"], v["free_gb"])
+                                  for mp, v in fs.items() if v))
+    if st["reasons"]:
+        print("Active signals:")
+        for k, (lvl, cat, msg) in st["reasons"].items():
+            print("  [%s] %s" % (lvl, msg))
+    else:
+        print("Active signals: none")
+    return 0
+
+
+def parse_when(s, default):
+    if not s:
+        return default
+    s = s.strip()
+    now = time.time()
+    rel = s.lstrip("-")
+    if rel[:-1].replace(".", "", 1).isdigit() and rel[-1] in "smhd":
+        mult = {"s": 1, "m": 60, "h": 3600, "d": 86400}[rel[-1]]
+        return now - float(rel[:-1]) * mult
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return time.mktime(time.strptime(s, fmt))
+        except ValueError:
+            pass
+    for fmt in ("%H:%M:%S", "%H:%M"):
+        try:
+            t = time.strptime(s, fmt)
+            d = datetime.datetime.now().replace(hour=t.tm_hour, minute=t.tm_min, second=t.tm_sec, microsecond=0)
+            ts = d.timestamp()
+            return ts - 86400 if ts > now + 60 else ts
+        except ValueError:
+            pass
+    raise SystemExit("cannot parse time: %r (use HH:MM, 'YYYY-MM-DD HH:MM' or 30m/2h)" % s)
+
+
+def cmd_history(args):
+    cfg = Config(args.config)
+    d = args.dir or cfg.s("history", "dir")
+    since = parse_when(args.since, time.time() - 900)
+    until = parse_when(args.until, time.time() + 1)
+    files = sorted(glob.glob(os.path.join(d, "history-*.csv")))
+    rows = []
+    for p in files:
+        try:
+            stamp = os.path.basename(p)[8:19]
+            fstart = time.mktime(time.strptime(stamp, "%Y%m%d-%H"))
+        except ValueError:
+            continue
+        if fstart > until or fstart + 3600 * 2 < since:
+            continue
+        with open(p, newline="") as f:
+            for r in csv.DictReader(f):
+                try:
+                    e = float(r["epoch"])
+                except (ValueError, KeyError, TypeError):
+                    continue
+                if since <= e <= until:
+                    rows.append(r)
+    rows.sort(key=lambda r: float(r["epoch"]))
+    if args.every > 1:
+        rows = rows[::args.every]
+    if args.csv:
+        if rows:
+            w = csv.DictWriter(sys.stdout, fieldnames=list(rows[0].keys()))
+            w.writeheader()
+            w.writerows(rows)
+        return 0
+    if not rows:
+        print("no samples in %s .. %s (history dir %s)" % (now_str(since), now_str(until), d))
+        return 1
+
+    def g(r, k, scale=1.0, fmt="%.1f"):
+        v = r.get(k)
+        if v in (None, ""):
+            return "-"
+        try:
+            return fmt % (float(v) * scale)
+        except ValueError:
+            return v
+
+    cols = [("time", 8), ("state", 4), ("availG", 6), ("anonG", 6), ("shmG", 5), ("cacheG", 6), ("swapG", 5),
+            ("swpo/s", 6), ("rflt/s", 6), ("mPSI", 5), ("mFul", 5), ("ioFul", 5), ("cpu%", 5), ("iow%", 4),
+            ("load1", 5), ("blk", 3), ("util", 4), ("eta", 6), ("dt", 4)]
+    print(" ".join("%*s" % (wd, n) for n, wd in cols) + "  signals")
+    last_day = None
+    for r in rows:
+        day = r["time"][:10]
+        if day != last_day:
+            print("--- %s ---" % day)
+            last_day = day
+        eta = r.get("eta_s")
+        vals = [r["time"][11:19], r["state"][:4], g(r, "mem_avail_mb", 1 / 1024.0), g(r, "anon_mb", 1 / 1024.0),
+                g(r, "shmem_mb", 1 / 1024.0), g(r, "cache_mb", 1 / 1024.0), g(r, "swap_used_mb", 1 / 1024.0, "%.2f"),
+                g(r, "swapout_mb_s"), g(r, "refault_s", 1, "%.0f"), g(r, "psi_mem_some10"), g(r, "psi_mem_full10"),
+                g(r, "psi_io_full10"), g(r, "cpu_pct", 1, "%.0f"), g(r, "iowait_pct", 1, "%.0f"), g(r, "load1"),
+                g(r, "procs_blocked", 1, "%.0f"), g(r, "disk_util", 1, "%.0f"),
+                fmt_eta(float(eta)) if eta not in (None, "") else "-", g(r, "interval_s", 1, "%.0f")]
+        print(" ".join("%*s" % (wd, v) for (n, wd), v in zip(cols, vals)) + "  " + r.get("reasons", ""))
+    return 0
+
+
+def cmd_events(args):
+    cfg = Config(args.config)
+    d = args.dir or cfg.s("history", "dir")
+    lines = []
+    for p in (os.path.join(d, "events.log.1"), os.path.join(d, "events.log")):
+        try:
+            with open(p) as f:
+                lines += f.readlines()
+        except OSError:
+            pass
+    if not lines:
+        print("no events recorded yet")
+        return 0
+    for line in lines[-args.n:]:
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        flag = "" if ev.get("notify") else "  (not notified: anti-flap)"
+        print("%s  %-8s %-9s %s%s" % (ev["time"], ev["channel"], ev["kind"], ev["title"], flag))
+        if args.verbose:
+            for b in ev.get("body", "").splitlines():
+                print("      " + b)
+    return 0
+
+
+def cmd_snapshots(args):
+    cfg = Config(args.config)
+    d = os.path.join(args.dir or cfg.s("history", "dir"), "snapshots")
+    files = sorted(glob.glob(os.path.join(d, "*.txt")))
+    for p in files[-args.n:]:
+        print("%8.1f KB  %s" % (os.path.getsize(p) / 1024.0, p))
+    if not files:
+        print("no snapshots in %s" % d)
+    return 0
+
+
+def cmd_snapshot(args):
+    try:
+        with open(os.path.join(args.run_dir or RUN_DIR, "sysmon.pid")) as f:
+            pid = int(f.read())
+        os.kill(pid, signal.SIGUSR1)
+    except PermissionError:
+        print("permission denied: run with sudo")
+        return 1
+    except (OSError, ValueError) as e:
+        print("cannot signal daemon: %s" % e)
+        return 1
+    print("snapshot requested; see `sysmon snapshots` in a few seconds")
+    return 0
+
+
+def cmd_config(args):
+    cfg = Config(args.config)
+    try:
+        cfg.validate()
+    except ValueError as e:
+        print("INVALID value: %s" % e)
+        return 1
+    print("# effective configuration (%s)" % (cfg.loaded[0] if cfg.loaded else "built-in defaults"))
+    for u in cfg.unknown:
+        print("# WARNING: unknown option ignored: %s" % u)
+    for sec in cfg.cp.sections():
+        print("[%s]" % sec)
+        for k, v in cfg.cp.items(sec):
+            print("%s = %s" % (k, v))
+    return 0
+
+
+# --------------------------------------------------------------------------
+# Self-test: simulated scenarios (no real memory/CPU/I/O load is generated)
+# --------------------------------------------------------------------------
+
+class Sim:
+    TOTAL = 63800.0
+
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.ev = Evaluator(cfg, 20)
+        self.p = Channel("pressure", cfg.f("general", "recovery_hold"), cfg.f("notify", "flap_guard"),
+                         cfg.f("notify", "update_interval"))
+        self.s = Channel("space", cfg.f("space", "recovery_hold"), 3600, 3600)
+        self.t = 0.0
+        self.events = []
+        self.step = cfg.f("general", "interval")
+        self.m = self.base()
+        self.trace = []
+
+    def base(self):
+        m = {k: 0.0 for k in HIST_BASE_COLS if k not in ("time", "state", "space_state", "disk_dev")}
+        m.update(mem_total_mb=self.TOTAL, mem_avail_mb=40000.0, anon_mb=20000.0, shmem_mb=2000.0, cache_mb=18000.0,
+                 kernel_mb=2000.0, swap_total_mb=2048.0, swap_used_mb=0.0, oom_kills=0, procs_blocked=0,
+                 load1=2.0, load5=2.0, load15=2.0, disk_dev="nvme0n1", ncpu=20,
+                 fs={"/": {"pct": 89.0, "free_gb": 50.0, "size_gb": 457.0}})
+        return m
+
+    def run(self, seconds, mutate=None):
+        end = self.t + seconds
+        while self.t < end:
+            self.t += self.step
+            if mutate:
+                mutate(self.t, self.m)
+            self.m["mem_avail_pct"] = 100.0 * self.m["mem_avail_mb"] / self.TOTAL
+            m = dict(self.m)
+            pl, pr = self.ev.evaluate(m, self.t)
+            sl, sr = self.ev.space(m, self.t)
+            for kind, notify, keys in self.p.update(self.t, pl, pr):
+                self.events.append((self.t, build_event(self.p, kind, notify, keys, pr, m, self.p)))
+            for kind, notify, keys in self.s.update(self.t, sl, sr):
+                self.events.append((self.t, build_event(self.s, kind, notify, keys, sr, m, self.s)))
+            self.trace.append((self.t, m.get("mem_avail_mb"), m.get("eta_s"), self.p.state))
+        return self
+
+    def kinds(self, notified_only=False, channel=None):
+        return [e["kind"] for _, e in self.events if (e["notify"] or not notified_only)
+                and (channel is None or e["channel"] == channel) and e["kind"] != "DOWNGRADE"]
+
+    def first(self, kind):
+        for t, e in self.events:
+            if e["kind"] == kind:
+                return t, e
+        return None, None
+
+
+def cmd_selftest(args):
+    cfg = Config(args.config)
+    results = []
+
+    def check(name, cond, detail=""):
+        results.append((name, bool(cond), detail))
+
+    def show(sim):
+        if args.verbose:
+            for t, e in sim.events:
+                print("    t=%5.0fs %-8s %-9s notify=%-5s %s" % (t, e["channel"], e["kind"], e["notify"], e["title"]))
+                if args.verbose > 1:
+                    for b in e["body"].splitlines():
+                        print("               " + b)
+
+    # 1-2. Incident replay: steady RAM decline until exhaustion, at two speeds.
+    for rate in (100.0, 25.0):
+        sim = Sim(cfg)
+        sim.run(60)
+
+        def decline(t, m, rate=rate):
+            m["mem_avail_mb"] = max(0.0, m["mem_avail_mb"] - rate * 5)
+            m["anon_mb"] += rate * 5
+            if m["mem_avail_mb"] < 0.05 * Sim.TOTAL:  # late phase: swap fills, PSI rises
+                m["swap_used_mb"] = min(2048.0, m["swap_used_mb"] + 60 * 5)
+                m["swapout_mb_s"] = 60.0
+                m["psi_mem_some10"] = min(90.0, m["psi_mem_some10"] + 8)
+                m["psi_mem_full10"] = min(70.0, m["psi_mem_full10"] + 5)
+
+        t_ex = None
+        while t_ex is None and sim.t < 4000:
+            sim.run(5, decline)
+            if sim.m["mem_avail_mb"] + (2048 - sim.m["swap_used_mb"]) <= 0.03 * Sim.TOTAL:
+                t_ex = sim.t
+        tw, ew = sim.first("WARNING")
+        tc, ec = sim.first("CRITICAL")
+        lead_w = (t_ex - tw) if tw is not None else None
+        lead_c = (t_ex - tc) if tc is not None else None
+        print("  scenario: RAM declining %.0f MB/s -> WARNING %s before exhaustion (\"%s\"), CRITICAL %s before" % (
+            rate, fmt_dur(lead_w) if lead_w else "NEVER", ew["title"] if ew else "-",
+            fmt_dur(lead_c) if lead_c else "NEVER"))
+        show(sim)
+        check("decline %.0f MB/s: WARNING >= 2 min before exhaustion" % rate, lead_w and lead_w >= 120,
+              "lead %s" % lead_w)
+        check("decline %.0f MB/s: CRITICAL >= 60 s before exhaustion" % rate, lead_c and lead_c >= 60,
+              "lead %s" % lead_c)
+        check("decline %.0f MB/s: CRITICAL body has memory breakdown" % rate,
+              ec and "Shmem:" in ec["body"] and "Swap:" in ec["body"] and "Memory PSI" in ec["body"])
+        check("decline %.0f MB/s: a notification mentions the prediction" % rate,
+              any("predicted" in (e["title"] + e["body"]) for _, e in sim.events if e["notify"]))
+
+    # 3. Short allocation spike: must not alert.
+    sim = Sim(cfg)
+    sim.m["mem_avail_mb"] = 15000.0
+    sim.run(120)
+
+    def spike(t, m):
+        m["mem_avail_mb"] = 7000.0 if 125 <= t < 135 else 15000.0
+
+    sim.run(200, spike)
+    show(sim)
+    check("10 s spike of -8 GB (avail 23% -> 11%): no alert", sim.kinds() == [], sim.kinds())
+
+    # 4. Decline that stops: prediction disappears and state recovers.
+    sim = Sim(cfg)
+    sim.m["mem_avail_mb"] = 25000.0
+    sim.run(100)
+
+    def decline_then_flat(t, m):
+        if m["mem_avail_mb"] > 12000:
+            m["mem_avail_mb"] -= 60 * 5
+
+    sim.run(900, decline_then_flat)
+    show(sim)
+    check("decline then stable: WARNING then RECOVERY, no CRITICAL",
+          sim.kinds() == ["WARNING", "RECOVERY"], sim.kinds())
+    check("decline then stable: prediction cleared at end", sim.trace[-1][2] is None)
+
+    # 5. Memory + I/O pressure combination -> CRITICAL naming both.
+    sim = Sim(cfg)
+    sim.run(60)
+
+    def mem_io(t, m):
+        on = t < 360
+        m["psi_mem_some10"] = 15.0 if on else 0.0
+        m["psi_io_full10"] = 20.0 if on else 0.0
+
+    sim.run(600, mem_io)
+    show(sim)
+    tc, ec = sim.first("CRITICAL")
+    check("memory + I/O pressure: WARNING, CRITICAL, RECOVERY", sim.kinds(True) == ["WARNING", "CRITICAL", "RECOVERY"],
+          sim.kinds(True))
+    check("memory + I/O pressure: CRITICAL says 'memory + I/O'", ec and "memory + I/O" in ec["title"],
+          ec and ec["title"])
+
+    # 6. Sustained single-state condition: exactly one notification; flapping suppressed.
+    sim = Sim(cfg)
+
+    def psi_on(t, m):
+        m["psi_mem_some10"] = 15.0
+
+    def psi_off(t, m):
+        m["psi_mem_some10"] = 0.0
+
+    sim.run(600, psi_on).run(120, psi_off)
+    n1 = sim.kinds(True)
+    sim.run(120, psi_on).run(120, psi_off)
+    n2 = sim.kinds(True)
+    sim.run(400, psi_off).run(60, psi_on)
+    n3 = sim.kinds(True)
+    show(sim)
+    check("10 min sustained WARNING: one WARNING + one RECOVERY notification", n1 == ["WARNING", "RECOVERY"], n1)
+    check("re-WARNING within 5 min of recovery: not notified", n2 == n1, n2)
+    check("WARNING after flap guard expired: notified again", n3 == n1 + ["WARNING"], n3)
+
+    # 7. Already WARNING for low RAM, then prediction appears -> one UPDATE notification.
+    sim = Sim(cfg)
+    sim.m["mem_avail_mb"] = 0.13 * Sim.TOTAL
+    sim.run(300)
+
+    def slow_decline(t, m):
+        m["mem_avail_mb"] -= 40 * 5
+
+    sim.run(80, slow_decline)
+    show(sim)
+    tu, eu = sim.first("UPDATE")
+    tc, _ = sim.first("CRITICAL")
+    check("in WARNING (low RAM) then decline: UPDATE notification with prediction",
+          eu and eu["notify"] and "predicted" in eu["title"] and (tc is None or tu < tc),
+          eu and eu["title"])
+
+    # 8. Disk space is an independent channel.
+    sim = Sim(cfg)
+    sim.m["fs"] = {"/": {"pct": 91.0, "free_gb": 41.0, "size_gb": 457.0},
+                   "/boot/efi": {"pct": 2.0, "free_gb": 0.49, "size_gb": 0.5}}
+    sim.run(60).run(60, psi_on)
+    show(sim)
+    check("disk space WARNING and memory WARNING both notified",
+          sim.kinds(True, "space") == ["WARNING"] and sim.kinds(True, "pressure") == ["WARNING"],
+          (sim.kinds(True, "space"), sim.kinds(True, "pressure")))
+    check("small /boot/efi not flagged by GB rule",
+          not any("/boot/efi" in json.dumps(e["reasons"]) for _, e in sim.events))
+
+    # 9. OOM kill -> immediate CRITICAL.
+    sim = Sim(cfg)
+    sim.run(30)
+    sim.run(5, lambda t, m: m.update(oom_kills=1))
+    sim.run(5, lambda t, m: m.update(oom_kills=0))
+    show(sim)
+    check("OOM kill: immediate CRITICAL", sim.kinds()[:1] == ["CRITICAL"], sim.kinds())
+
+    # 10. CPU-only saturation -> WARNING, not CRITICAL.
+    sim = Sim(cfg)
+    sim.run(300, lambda t, m: m.update(psi_cpu_some60=60.0, psi_cpu_some10=60.0, load1=25.0, cpu_pct=99.0))
+    show(sim)
+    check("CPU busy alone (PSI 60%, load 25/20): WARNING only", sim.kinds() == ["WARNING"], sim.kinds())
+
+    # 11. Severe I/O stall alone -> CRITICAL.
+    sim = Sim(cfg)
+    sim.run(120, lambda t, m: m.update(psi_io_full10=55.0, psi_io_some10=80.0, procs_blocked=20,
+                                       iowait_pct=35.0, disk_util=100.0))
+    show(sim)
+    tc, ec = sim.first("CRITICAL")
+    check("I/O stall (PSI full 55%, 20 blocked): CRITICAL", ec is not None, sim.kinds())
+
+    print()
+    fails = 0
+    for name, ok, detail in results:
+        print("  %s  %s%s" % ("PASS" if ok else "FAIL", name, "" if ok else "   -> %s" % (detail,)))
+        fails += not ok
+    print("\n%d/%d checks passed" % (len(results) - fails, len(results)))
+    return 1 if fails else 0
+
+
+# --------------------------------------------------------------------------
+
+def main():
+    if os.path.basename(sys.argv[0]) == "sysmon-status" and (len(sys.argv) == 1 or sys.argv[1].startswith("-")):
+        sys.argv.insert(1, "status")
+    ap = argparse.ArgumentParser(prog="sysmon", description="System resource & pressure monitor (observe/notify only)")
+    ap.add_argument("--config", default=CONF_PATH)
+    sub = ap.add_subparsers(dest="cmd")
+    p = sub.add_parser("daemon")
+    p.add_argument("--dir", help="history directory (default from config)")
+    p.add_argument("--run-dir", help="runtime directory (default /run/sysmon)")
+    p.add_argument("--no-mlock", action="store_true")
+    p.add_argument("--duration", type=float, default=0, help="stop after N seconds (testing)")
+    p = sub.add_parser("notify")
+    p.add_argument("--run-dir")
+    p.add_argument("--poll", type=float, default=2.0)
+    p.add_argument("--test", action="store_true", help="send one test notification and exit")
+    p = sub.add_parser("status")
+    p.add_argument("--run-dir")
+    p = sub.add_parser("history", help="table of recorded samples")
+    p.add_argument("--since", help="HH:MM, 'YYYY-MM-DD HH:MM', or 30m / 2h ago (default 15m)")
+    p.add_argument("--until")
+    p.add_argument("--every", type=int, default=1, help="show every Nth sample")
+    p.add_argument("--csv", action="store_true", help="raw CSV output (all columns)")
+    p.add_argument("--dir")
+    p = sub.add_parser("events")
+    p.add_argument("-n", type=int, default=30)
+    p.add_argument("-v", "--verbose", action="store_true")
+    p.add_argument("--dir")
+    p = sub.add_parser("snapshots")
+    p.add_argument("-n", type=int, default=20)
+    p.add_argument("--dir")
+    p = sub.add_parser("snapshot")
+    p.add_argument("--run-dir")
+    sub.add_parser("config")
+    p = sub.add_parser("selftest")
+    p.add_argument("-v", "--verbose", action="count", default=0)
+    args = ap.parse_args()
+    if args.cmd == "daemon":
+        cfg = Config(args.config)
+        cfg.validate()
+        Daemon(cfg, args).run()
+        return 0
+    handlers = {"notify": cmd_notify, "status": cmd_status, "history": cmd_history, "events": cmd_events,
+                "snapshots": cmd_snapshots, "snapshot": cmd_snapshot, "config": cmd_config,
+                "selftest": cmd_selftest}
+    if args.cmd not in handlers:
+        ap.print_help()
+        return 1
+    return handlers[args.cmd](args)
+
+
+if __name__ == "__main__":
+    sys.exit(main() or 0)
